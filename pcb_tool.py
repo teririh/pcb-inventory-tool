@@ -15,25 +15,30 @@ def cn_num_to_arabic(cn_num):
         cn_num = cn_num.replace(k, str(v))
     return re.sub(r"\D", "", cn_num)
 
-# ==================== 数据层：表格加载与保存 ====================
+# ==================== 数据层：表格加载与保存（新增缓存） ====================
 def init_files():
     if not os.path.exists(INVENTORY_FILE):
         pd.DataFrame(columns=["PCB型号", "版本", "数量", "存放位置"]).to_excel(INVENTORY_FILE, index=False)
     if not os.path.exists(BOM_FILE):
         pd.DataFrame(columns=["PCB型号", "器件型号", "器件描述"]).to_excel(BOM_FILE, index=False)
 
+# 新增缓存：避免重复读取文件
+@st.cache_data(ttl=10)  # 10秒缓存，兼顾实时性和速度
 def load_inventory():
     init_files()
     return pd.read_excel(INVENTORY_FILE)
 
 def save_inventory(df):
+    st.cache_data.clear()  # 保存后清空缓存
     df.to_excel(INVENTORY_FILE, index=False)
 
+@st.cache_data(ttl=10)
 def load_bom():
     init_files()
     return pd.read_excel(BOM_FILE)
 
 def save_bom(df):
+    st.cache_data.clear()
     df.to_excel(BOM_FILE, index=False)
 
 # ==================== 逻辑层：全场景口语提取规则 ====================
@@ -51,7 +56,7 @@ def super_extract_info(text):
     if reverse_loc_match:
         location = reverse_loc_match.group(1).strip()
 
-       # --- 2. 提取PCB型号（修复：支持纯型号+版本分离） ---
+    # --- 2. 提取PCB型号 ---
     model_patterns = [
         r"\d+\s*(?:块|片|个|只|pcs|张)[：\s]*([a-z]*\d+(?:-\d+)*)", 
         r"pcb[a-z]*[-_\s]*([a-z]*\d+(?:-\d+)*)",
@@ -69,7 +74,7 @@ def super_extract_info(text):
             prefix = m.group(1).upper()
             break
 
-    # 版本号拼接（保持不变）
+    # 提取版本号
     ver_patterns = [
         r"(?:版本|版)[本号]*[：:\s]*([a-z]*\d+(?:\.\d+)*)",
         r"([a-z]*\d+(?:\.\d+)*)[：:\s]*(?:版本|版)",
@@ -85,29 +90,24 @@ def super_extract_info(text):
 
     if prefix:
         pcb_model = prefix
-        # 【新增】如果型号里已经包含横杠，强制拆分出版本
+        # 如果型号里包含横杠，强制拆分出版本
         if "-" in pcb_model:
             parts = pcb_model.split("-")
-            # 取最后一部分作为版本（如果是数字的话）
             if parts[-1].isdigit():
                 version = parts[-1]
-                pcb_model = "-".join(parts[:-1])  # 前面的部分作为纯型号
+                pcb_model = "-".join(parts[:-1])
 
-    # 版本号拼接（保持不变）
-    ver_patterns = [
-
-    # --- 3. 提取数量（新增：支持简单的“数字+单位”结构） ---
+    # --- 3. 提取数量 ---
     qty_patterns = [
         r"(?:有|一共|总共|还有|剩|数量)[：:\s]*([一二三四五六七八九十两\d]+)\s*(?:块|片|个|只|pcs|张)",
         r"([一二三四五六七八九十两\d]+)\s*(?:块|片|个|只|pcs|张)\s*(?:板子|pcb|板卡)",
-        r"(\d+)\s*(?:块|片|个|只|pcs|张)",  # 新增：直接匹配“2块”这种简单结构
+        r"(\d+)\s*(?:块|片|个|只|pcs|张)",
     ]
     for pat in qty_patterns:
         m = re.search(pat, clean_text_lower)
         if m:
             raw_qty = m.group(1)
             quantity = cn_num_to_arabic(raw_qty)
-            # 确保只保留纯数字
             quantity = re.sub(r"\D", "", quantity)
             break
 
@@ -127,7 +127,7 @@ def super_extract_info(text):
                     location = loc_raw
                     break
 
-    return pcb_model, version, quantity, location  # 新增版本返回值
+    return pcb_model, version, quantity, location
 
 # ==================== 界面层 ====================
 st.set_page_config(page_title="PCB智能库存管理系统", layout="wide")
@@ -139,7 +139,7 @@ init_files()
 # 标签页布局
 tab1, tab5, tab2, tab3, tab4 = st.tabs(["📝 信息录入", "🗑️ 智能删除", "🔍 库存查询", "📋 BOM管理", "📊 数据总览"])
 
-# -------------------- 标签页 1：信息录入（新增快捷按钮） --------------------
+# -------------------- 标签页 1：信息录入 --------------------
 with tab1:
     st.header("智能录入")
     
@@ -150,7 +150,6 @@ with tab1:
         btn_col1, btn_col2, btn_col3 = st.columns([1,1,2])
         with btn_col1:
             if st.button("粘贴剪切板"):
-                # 用JS组件读取剪切板
                 paste_js = """
                 <script>
                 async function pasteFromClipboard() {
@@ -187,9 +186,9 @@ with tab1:
         
         if st.button("开始智能提取", type="primary"):
             if input_text:
-                m, v, q, l = super_extract_info(input_text)  # 接收4个返回值
+                m, v, q, l = super_extract_info(input_text)
                 st.session_state['new_model'] = m
-                st.session_state['new_version'] = v  # 新增版本状态
+                st.session_state['new_version'] = v
                 st.session_state['new_qty'] = q
                 st.session_state['new_loc'] = l
                 st.success("提取完成！请在右侧确认")
@@ -202,13 +201,13 @@ with tab1:
             st.info("请先在左侧点击提取")
         else:
             fm = st.text_input("PCB型号", value=st.session_state['new_model'])
-            fv = st.text_input("版本", value=st.session_state.get('new_version', ''))  # 新增版本输入框
+            fv = st.text_input("版本", value=st.session_state.get('new_version', ''))
             fq = st.text_input("数量", value=st.session_state['new_qty'])
             fl = st.text_input("存放位置", value=st.session_state['new_loc'])
             
             if st.button("✅ 保存入库"):
                 df = load_inventory()
-                new_row = pd.DataFrame([[fm, fv, fq, fl]], columns=df.columns)  # 按新列顺序保存
+                new_row = pd.DataFrame([[fm, fv, fq, fl]], columns=df.columns)
                 df = pd.concat([df, new_row], ignore_index=True)
                 save_inventory(df)
                 st.success(f"已保存：{fm}")
@@ -310,31 +309,25 @@ with tab4:
     st.subheader("完整库存表")
     st.dataframe(df_inv, use_container_width=True)
 
-# -------------------- 新增标签页 5：智能删除 --------------------
+# -------------------- 标签页 5：智能删除 --------------------
 with tab5:
     st.header("智能删除（支持口语化输入搜索）")
     
-    # 1. 输入区域（复用智能提取）
+    # 1. 输入区域
     del_input = st.text_input(
         "输入要删除的PCB信息（支持型号/位置/口语）：",
         placeholder="例如：PCB-S876 或 5F 或 有一块S876在小房间"
     )
     
-        # 2. 搜索按钮（修复：支持直接输入纯型号搜索）
+    # 2. 搜索按钮
     if st.button("🔍 搜索要删除的记录"):
         if del_input:
-            # 复用智能提取函数
-            m, q, l = super_extract_info(del_input)
-            
-            # 构建搜索关键词
+            m, v, q, l = super_extract_info(del_input)
             keywords = [k for k in [m, l] if k]
-            
-            # 【新增兜底】如果没识别到关键词，直接把输入内容当关键词
             if not keywords:
                 keywords = [del_input.strip()]
             
             df = load_inventory()
-            # 模糊搜索
             mask = df.astype(str).apply(
                 lambda x: x.str.contains('|'.join(keywords), case=False, na=False)
             ).any(axis=1)
@@ -357,27 +350,26 @@ with tab5:
         
         df_to_show = st.session_state['del_result']
         
-        # 用循环生成每行带删除按钮的表格
         for idx, row in df_to_show.iterrows():
             col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 1])
             col1.write(f"**PCB型号**: {row['PCB型号']}")
-            col2.write(f"**版本**: {row.get('版本', '')}")  # 显示版本
+            col2.write(f"**版本**: {row.get('版本', '')}")
             col3.write(f"**数量**: {row['数量']}")
             col4.write(f"**位置**: {row['存放位置']}")
             
             # 删除按钮
-            if col4.button("🗑️ 删除", key=f"del_{idx}"):
-                # 从完整库存表里删除这一行
+            if col5.button("🗑️ 删除", key=f"del_{idx}"):  # 修复按钮列索引错误
                 full_df = load_inventory()
-                # 找到匹配的行并删除（用索引差集）
-                full_df = full_df.drop(full_df[(full_df['PCB型号'] == row['PCB型号']) & 
-                                                (full_df.get('版本', '') == row.get('版本', '')) &  # 加版本匹配
-                                                (full_df['数量'] == row['数量']) & 
-                                                (full_df['存放位置'] == row['存放位置'])].index)
+                # 精准匹配删除
+                del_mask = (full_df['PCB型号'] == row['PCB型号']) & \
+                           (full_df.get('版本', '') == row.get('版本', '')) & \
+                           (full_df['数量'] == row['数量']) & \
+                           (full_df['存放位置'] == row['存放位置'])
+                full_df = full_df[~del_mask]
                 save_inventory(full_df)
                 st.success(f"已删除：{row['PCB型号']} ({row['存放位置']})")
                 st.balloons()
-                # 更新会话状态并刷新
+                # 更新会话状态
                 st.session_state['del_result'] = full_df[full_df['PCB型号'].isin(df_to_show['PCB型号'])]
                 st.rerun()
         
